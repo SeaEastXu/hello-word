@@ -13,6 +13,7 @@ import android.view.View;
 import android.widget.*;
 
 import com.seaeast.e108gnss.core.GnssSnapshot;
+import com.seaeast.e108gnss.core.RtcmDiagnostics;
 import com.seaeast.e108gnss.service.GnssForegroundService;
 
 import java.io.*;
@@ -22,12 +23,12 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
     private static final int REQ_RAW_FILE=1001;
     private GnssForegroundService svc;
     private boolean bound;
-    private TextView tvStatus,tvFix,tvPos,tvMotion,tvSat,tvAux,tvDiag,tvRtcm,tvUsbRegistry,tvPaths,tvLog;
+    private TextView tvStatus,tvFix,tvPos,tvMotion,tvSat,tvAux,tvDiag,tvRtcm,tvRawRec,tvUsbRegistry,tvPaths,tvLog;
     private CheckBox cbMock;
     private EditText etCmd;
     private final StringBuilder logBuf=new StringBuilder();
     private final Handler uiHandler=new Handler(Looper.getMainLooper());
-    private final Runnable diagTick=new Runnable(){@Override public void run(){if(bound&&svc!=null){if(tvDiag!=null)tvDiag.setText("数据链路："+svc.diagnosticStats());if(tvRtcm!=null)tvRtcm.setText(svc.rtcmDiagnosticSummary());if(tvUsbRegistry!=null)tvUsbRegistry.setText(svc.deviceRegistrySummary());}uiHandler.postDelayed(this,1000);}};
+    private final Runnable diagTick=new Runnable(){@Override public void run(){if(bound&&svc!=null){if(tvDiag!=null)tvDiag.setText("数据链路："+svc.diagnosticStats());if(tvRtcm!=null)tvRtcm.setText(svc.rtcmDiagnosticSummary());if(tvRawRec!=null)tvRawRec.setText(RtcmDiagnostics.rawRecordingStatus());if(tvUsbRegistry!=null)tvUsbRegistry.setText(svc.deviceRegistrySummary());}uiHandler.postDelayed(this,1000);}};
 
     private final ServiceConnection conn=new ServiceConnection(){
         @Override public void onServiceConnected(ComponentName n,android.os.IBinder b){
@@ -49,7 +50,7 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
     }
 
     @Override protected void onNewIntent(Intent i){super.onNewIntent(i);setIntent(i);handleAttachIntent(i);}
-    private void handleAttachIntent(Intent i){ if(i!=null && android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(i.getAction())) { } }
+    private void handleAttachIntent(Intent i){ if(i!=null && android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(i.getAction())) { /* service scans */ } }
 
     @Override protected void onDestroy(){uiHandler.removeCallbacks(diagTick);if(bound&&svc!=null)svc.removeUiListener(this);if(bound)unbindService(conn);super.onDestroy();}
 
@@ -57,9 +58,9 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
         ScrollView scroll=new ScrollView(this);
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setPadding(20,16,20,30);scroll.addView(root);
 
-        TextView title=t("E108-GN07IS 车机GNSS调试驱动 v0.5.0",22,true);root.addView(title);
+        TextView title=t("E108-GN07IS 车机GNSS调试驱动 v0.5.1",22,true);root.addView(title);
         root.addView(t("固件专用：0x55002613   CH340 / UART0 / 460800 / 8N1",14,true));
-        root.addView(t("本版重点：RTCM MSM4/5/7 实时诊断，为下一步 Native GNSS HAL / Android Raw GNSS 转换确认输入数据条件。",13,false));
+        root.addView(t("目标：UIS7870 Android 13。支持多CH340共存、跨USB口识别E108、NMEA + RTCM3 + Cynosure AGNSS、TTFF与辅助数据缓存/回灌。",13,false));
 
         tvStatus=t("状态：服务启动中…",16,true);root.addView(tvStatus);
         tvFix=t("定位：--",18,true);root.addView(tvFix);
@@ -69,10 +70,15 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
         tvAux=t("辅助缓存：--",14,false);root.addView(tvAux);
         tvDiag=t("数据链路：--",13,true);root.addView(tvDiag);
 
-        root.addView(section("RTCM / Raw GNSS 诊断（v0.5重点）"));
+        root.addView(section("RTCM / Raw GNSS 诊断（v0.5.1）"));
         tvRtcm=t("等待RTCM3数据…",12,false);tvRtcm.setTypeface(Typeface.MONOSPACE);tvRtcm.setTextIsSelectable(true);root.addView(tvRtcm);
-        root.addView(t("GOOD 表示已观察到多星座 MSM7 以及伪距(PR)、载波相位(PH)、距离率(RR)、C/N0 字段，说明 E108 原始观测具备进入 Native HAL 转换测试的基础。这里仍不是 Android GnssMeasurementsEvent。",12,false));
-        root.addView(btnWide("清零RTCM / Raw统计",v->{if(svc!=null)svc.resetRtcmDiagnostics();}));
+        root.addView(t("说明：这里诊断E108是否稳定输出RTCM MSM4/5/7及关键观测字段。OBS_READY表示原始观测具备进入Native HAL转换测试的条件，不等于Android GnssMeasurementsEvent已经接通。",12,false));
+        root.addView(btnWide("清零RTCM/Raw统计",v->{if(svc!=null)svc.resetRtcmDiagnostics();}));
+        tvRawRec=t("Raw录制：--",12,false);tvRawRec.setTextIsSelectable(true);root.addView(tvRawRec);
+        LinearLayout rr=row();
+        rr.addView(btn("开始RTCM原始录制",v->{if(svc!=null){String st=RtcmDiagnostics.startRawRecording(getExternalFilesDir(null));Toast.makeText(this,st.startsWith("录制中")?"已开始RTCM录制":st,Toast.LENGTH_LONG).show();}}));
+        rr.addView(btn("停止录制",v->{if(svc!=null){RtcmDiagnostics.stopRawRecording();Toast.makeText(this,"RTCM录制已停止",Toast.LENGTH_SHORT).show();}}));root.addView(rr);
+        root.addView(t("v0.5.1新增：区分frame Hz与epoch Hz，计入NavIC，并显示PR/PH/RR/CNR完整度。Raw文件保存在本App外部目录 raw/ 下，可用ADB拉取后离线逐帧分析。",12,false));
 
         root.addView(section("USB / CH340 多设备识别"));
         LinearLayout r1=row();
@@ -123,8 +129,8 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
 
         root.addView(section("0x55002613 当前/推荐检查点"));
         TextView profile=t(
-                "现阶段建议保持你已验证的导航输出速率。v0.5 先观察实际 RTCM 类型和频率：重点看 1077/1087/1097/1127（MSM7），以及 1019/1020/1042/1045/1046（星历）。\n"+
-                "当 Raw状态显示 GOOD 后，再进入 Native GNSS HAL → GnssMeasurement/GnssClock 阶段。",
+                "现阶段建议保持你已验证的导航输出速率。v0.5.1 同时观察 frame Hz 与 epoch Hz，重点确认 BDS 是否因同一epoch分帧而出现更高frame Hz。\n"+
+                "如果PH完整度持续很低，先保留Raw录制文件，再做逐卫星/逐signal离线分析。",
                 13,false);root.addView(profile);
 
         root.addView(section("文件 / 日志"));
@@ -153,7 +159,7 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
         }
     }
 
-    private void refreshPaths(){if(svc==null)return;File l=svc.getLogFile(),c=svc.getCacheFile();tvPaths.setText("日志："+(l==null?"--":l.getAbsolutePath())+"\n缓存："+(c==null?"--":c.getAbsolutePath()));}
+    private void refreshPaths(){if(svc==null)return;File l=svc.getLogFile(),c=svc.getCacheFile();tvPaths.setText("日志："+(l==null?"--":l.getAbsolutePath())+"\n缓存："+(c==null?"--":c.getAbsolutePath())+"\nRaw："+RtcmDiagnostics.rawRecordingStatus());}
 
     @Override public void onSnapshot(GnssSnapshot s){runOnUiThread(()->{
         tvFix.setText("定位："+s.fixText+"  quality="+s.fixQuality);
