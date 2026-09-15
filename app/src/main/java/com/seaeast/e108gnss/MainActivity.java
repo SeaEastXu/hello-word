@@ -22,12 +22,12 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
     private static final int REQ_RAW_FILE=1001;
     private GnssForegroundService svc;
     private boolean bound;
-    private TextView tvStatus,tvFix,tvPos,tvMotion,tvSat,tvAux,tvDiag,tvUsbRegistry,tvPaths,tvLog;
+    private TextView tvStatus,tvFix,tvPos,tvMotion,tvSat,tvAux,tvDiag,tvRtcm,tvUsbRegistry,tvPaths,tvLog;
     private CheckBox cbMock;
     private EditText etCmd;
     private final StringBuilder logBuf=new StringBuilder();
     private final Handler uiHandler=new Handler(Looper.getMainLooper());
-    private final Runnable diagTick=new Runnable(){@Override public void run(){if(bound&&svc!=null){if(tvDiag!=null)tvDiag.setText("数据链路："+svc.diagnosticStats());if(tvUsbRegistry!=null)tvUsbRegistry.setText(svc.deviceRegistrySummary());}uiHandler.postDelayed(this,1000);}};
+    private final Runnable diagTick=new Runnable(){@Override public void run(){if(bound&&svc!=null){if(tvDiag!=null)tvDiag.setText("数据链路："+svc.diagnosticStats());if(tvRtcm!=null)tvRtcm.setText(svc.rtcmDiagnosticSummary());if(tvUsbRegistry!=null)tvUsbRegistry.setText(svc.deviceRegistrySummary());}uiHandler.postDelayed(this,1000);}};
 
     private final ServiceConnection conn=new ServiceConnection(){
         @Override public void onServiceConnected(ComponentName n,android.os.IBinder b){
@@ -57,9 +57,9 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
         ScrollView scroll=new ScrollView(this);
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setPadding(20,16,20,30);scroll.addView(root);
 
-        TextView title=t("E108-GN07IS 车机GNSS调试驱动 v0.4.2",22,true);root.addView(title);
+        TextView title=t("E108-GN07IS 车机GNSS调试驱动 v0.5.0",22,true);root.addView(title);
         root.addView(t("固件专用：0x55002613   CH340 / UART0 / 460800 / 8N1",14,true));
-        root.addView(t("目标：UIS7870 Android 13。支持多CH340共存、跨USB口识别E108、NMEA + RTCM3 + Cynosure AGNSS、TTFF与辅助数据缓存/回灌。",13,false));
+        root.addView(t("本版重点：RTCM MSM4/5/7 实时诊断，为下一步 Native GNSS HAL / Android Raw GNSS 转换确认输入数据条件。",13,false));
 
         tvStatus=t("状态：服务启动中…",16,true);root.addView(tvStatus);
         tvFix=t("定位：--",18,true);root.addView(tvFix);
@@ -68,6 +68,11 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
         tvSat=t("卫星/DOP：--",15,false);root.addView(tvSat);
         tvAux=t("辅助缓存：--",14,false);root.addView(tvAux);
         tvDiag=t("数据链路：--",13,true);root.addView(tvDiag);
+
+        root.addView(section("RTCM / Raw GNSS 诊断（v0.5重点）"));
+        tvRtcm=t("等待RTCM3数据…",12,false);tvRtcm.setTypeface(Typeface.MONOSPACE);tvRtcm.setTextIsSelectable(true);root.addView(tvRtcm);
+        root.addView(t("GOOD 表示已观察到多星座 MSM7 以及伪距(PR)、载波相位(PH)、距离率(RR)、C/N0 字段，说明 E108 原始观测具备进入 Native HAL 转换测试的基础。这里仍不是 Android GnssMeasurementsEvent。",12,false));
+        root.addView(btnWide("清零RTCM / Raw统计",v->{if(svc!=null)svc.resetRtcmDiagnostics();}));
 
         root.addView(section("USB / CH340 多设备识别"));
         LinearLayout r1=row();
@@ -78,7 +83,7 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
         r1b.addView(btn("重新识别E108",v->{if(svc!=null)svc.relearnE108Device();}));
         r1b.addView(btn("忘记E108绑定",v->{if(svc!=null)svc.forgetE108DeviceBinding();}));root.addView(r1b);
         tvUsbRegistry=t("设备识别：--",12,false);tvUsbRegistry.setTextIsSelectable(true);root.addView(tvUsbRegistry);
-        root.addView(t("不把 /001/009 等总线地址当身份。优先使用已学习的 VID/PID + USB version + 接口/端点指纹；当前实车 E108 桥版本特征为 82.33，胎压桥为 2.64。最终仍由 GGA/RMC/GSV/RTCM/F1D9 协议帧确认。未知CH340只做非强制 claim，避免抢占胎压。",12,false));
+        root.addView(t("不把 /001/009 等总线地址当身份。当前实车 E108 CH340 特征为 USB version 82.33，胎压桥为 2.64；最终仍由 GGA/RMC/GSV/RTCM/F1D9 协议确认。",12,false));
 
         root.addView(section("冷启动 / AGNSS 测试"));
         LinearLayout r2=row();
@@ -95,32 +100,31 @@ public class MainActivity extends Activity implements GnssForegroundService.UiLi
         r5.addView(btn("清空辅助缓存",v->{if(svc!=null)svc.clearCache();}));root.addView(r5);
         root.addView(btnWide("导入并注入 AGNSS/RTCM 原始 .bin",v->openRawFile()));
 
-        root.addView(section("地图快速验证（仅测试）"));
+        root.addView(section("地图快速验证（Mock，当前已实车通过）"));
         cbMock=new CheckBox(this);cbMock.setText("把E108位置作为 Android Mock GPS 输出");cbMock.setTextSize(14);root.addView(cbMock);
         cbMock.setOnCheckedChangeListener((btt,on)->{if(svc!=null)svc.setMockEnabled(on);});
         Button mockHelp=btnWide("打开开发者选项（选择本App为模拟位置信息应用）",v->{try{startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));}catch(Exception e){Toast.makeText(this,"无法打开开发者选项",Toast.LENGTH_SHORT).show();}});root.addView(mockHelp);
+
+        root.addView(section("导航软件实车速率记录"));
+        root.addView(t("• 百度汽车版：NMEA 2 Hz + RTCM 20 Hz（已实测流畅）\n• 高德手机版：NMEA 1 Hz + RTCM 1 Hz\n• 腾讯车机版：NMEA 2 Hz + RTCM 20 Hz；其 10 Hz 高频模式后续继续验证",12,false));
 
         root.addView(section("E108 ASCII 控制台"));
         etCmd=new EditText(this);etCmd.setSingleLine(true);etCmd.setText("$POLCFGSAVE");etCmd.setTextSize(14);root.addView(etCmd);
         root.addView(btnWide("发送 ASCII + CRLF",v->{if(svc!=null)svc.sendAscii(etCmd.getText().toString().trim());}));
 
         root.addView(section("参考驱动 v8.0.5 初始化命令实验"));
-        root.addView(t("仅用于A/B研究：v8.0.5比v8.0.4新增的3帧 BA CE 二进制命令，共46字节。当前不知道其具体语义，因此不会自动发送。测试前先记录RX/NMEA/RTCM计数。",12,false));
+        root.addView(t("仅用于A/B研究：v8.0.5比v8.0.4新增的3帧 BA CE 二进制命令，共46字节。当前不知道其具体语义，因此不会自动发送。",12,false));
         root.addView(btnWide("实验：发送v8.0.5三帧 BA CE（需确认）",v->new android.app.AlertDialog.Builder(this)
                 .setTitle("实验命令确认")
-                .setMessage("这3帧命令来自v8.0.4/8.0.5二进制差异，具体含义尚未确认。只建议在可恢复配置、静态测试条件下发送。是否继续？")
+                .setMessage("这3帧命令来自v8.0.4/8.0.5二进制差异，具体含义尚未确认。是否继续？")
                 .setNegativeButton("取消",null)
                 .setPositiveButton("发送",(d,w)->{if(svc!=null)new Thread(()->svc.sendV805InitExperiment(),"bace-exp").start();})
                 .show()));
 
         root.addView(section("0x55002613 当前/推荐检查点"));
         TextView profile=t(
-                "当前你的配置（已按上传JSON核对）：\n"+
-                "• Baudrate=460800, Working Rate=5Hz, Measurement Rate=5Hz\n"+
-                "• Flash Aiding=ENABLE, Fast Fix=FULL-TIME, Long Ephemeris=ENABLE\n"+
-                "• Msg Input Mask=0x3F（UART0_RTCM / UART0_AGNSS 已开）\n"+
-                "• NMEA=0x827（GGA/GSA/GSV/RMC/INS），RTCM=0x1，EPH周期300s\n"+
-                "后续A/B建议：NMEA增加VTG/CLK/ANT；RTCM增加EPH并设60s；RTK车辆模式测试High Precision。",
+                "现阶段建议保持你已验证的导航输出速率。v0.5 先观察实际 RTCM 类型和频率：重点看 1077/1087/1097/1127（MSM7），以及 1019/1020/1042/1045/1046（星历）。\n"+
+                "当 Raw状态显示 GOOD 后，再进入 Native GNSS HAL → GnssMeasurement/GnssClock 阶段。",
                 13,false);root.addView(profile);
 
         root.addView(section("文件 / 日志"));
