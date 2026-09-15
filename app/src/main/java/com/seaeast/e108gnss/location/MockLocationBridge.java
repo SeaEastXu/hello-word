@@ -10,7 +10,7 @@ import com.seaeast.e108gnss.core.GnssSnapshot;
 
 public final class MockLocationBridge {
     private final LocationManager lm;
-    private boolean enabled;
+    private volatile boolean enabled;
 
     public MockLocationBridge(Context context) {
         lm = (LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
