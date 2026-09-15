@@ -37,6 +37,7 @@ public class GnssForegroundService extends Service {
     private final IBinder binder=new LocalBinder();
     private final CopyOnWriteArrayList<UiListener> listeners=new CopyOnWriteArrayList<>();
     private final NmeaParser nmea=new NmeaParser();
+    private final RtcmDiagnostics rtcmDiagnostics=new RtcmDiagnostics();
     private UsbManager usb;
     private UsbCh340Transport serial;
     private StreamDemux demux;
@@ -188,7 +189,13 @@ public class GnssForegroundService extends Service {
         if(ttffStart>0&&s.fix&&!lastFix){double sec=(SystemClock.elapsedRealtime()-ttffStart)/1000.0;for(UiListener l:listeners)l.onTtff(ttffLabel,sec);log("TTFF "+ttffLabel+"="+sec+"s");ttffStart=-1;}lastFix=s.fix;
         for(UiListener l:listeners)try{l.onSnapshot(s);}catch(Exception ignored){}
     }
-    private void handleRtcm(byte[] f){if(Rtcm3.valid(f)){confirmE108("RTCM "+Rtcm3.messageType(f));if(Rtcm3.isEphemerisType(Rtcm3.messageType(f))){cache.putRtcm(f,System.currentTimeMillis());notifyCache();}}}
+    private void handleRtcm(byte[] f){
+        rtcmDiagnostics.onFrame(f);
+        if(Rtcm3.valid(f)){
+            confirmE108("RTCM "+Rtcm3.messageType(f));
+            if(Rtcm3.isEphemerisType(Rtcm3.messageType(f))){cache.putRtcm(f,System.currentTimeMillis());notifyCache();}
+        }
+    }
     private void handleCyn(byte[] f){if(CynosurePacket.valid(f)){confirmE108("F1D9 "+CynosurePacket.id(f));cache.putCynosure(f,System.currentTimeMillis());notifyCache();}}
     private static String nmeaType(String s){if(s==null||!s.startsWith("$"))return "";int e=s.indexOf(',');if(e<0)e=s.indexOf('*');if(e<0)e=s.length();String h=s.substring(1,e).toUpperCase(Locale.ROOT);return h.length()>=3?h.substring(h.length()-3):h;}
 
@@ -208,14 +215,16 @@ public class GnssForegroundService extends Service {
     public void clearCache(){cache.clear();notifyCache();}
     public File getLogFile(){return logFile;}
     public File getCacheFile(){return cache.getFile();}
-    public String diagnosticStats(){long age=lastNmeaElapsed==0?-1:SystemClock.elapsedRealtime()-lastNmeaElapsed;long rx=serial==null?0:serial.getRxBytes();return String.format(Locale.US,"RX=%dB NMEA=%d GGA=%d RMC=%d mock=%d age=%dms E108=%s",rx,nmeaCount,ggaCount,rmcCount,mockCount,age,confirmed?"YES":"NO");}
+    public String rtcmDiagnosticSummary(){return rtcmDiagnostics.summary();}
+    public void resetRtcmDiagnostics(){rtcmDiagnostics.reset();log("RTCM/Raw diagnostic counters reset");}
+    public String diagnosticStats(){long age=lastNmeaElapsed==0?-1:SystemClock.elapsedRealtime()-lastNmeaElapsed;long rx=serial==null?0:serial.getRxBytes();return String.format(Locale.US,"RX=%dB NMEA=%d GGA=%d RMC=%d mock=%d age=%dms E108=%s | %s",rx,nmeaCount,ggaCount,rmcCount,mockCount,age,confirmed?"YES":"NO",rtcmDiagnostics.brief());}
 
     private void notifyCache(){if(cache==null)return;long now=System.currentTimeMillis();int f=cache.countFresh(now),a=cache.countAll(),r=cache.countRtcmFresh(now),c=cache.countCynFresh(now);for(UiListener l:listeners)try{l.onCacheChanged(f,a,r,c);}catch(Exception ignored){}}
     private void status(String s){log("STATUS "+s);for(UiListener l:listeners)try{l.onStatus(s);}catch(Exception ignored){}}
     private void log(String s){Log.i("E108GNSS",s);String line=new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS",Locale.US).format(new Date())+" "+s;try{if(logWriter!=null){logWriter.write(line);logWriter.newLine();logWriter.flush();}}catch(Exception ignored){}for(UiListener l:listeners)try{l.onLog(line);}catch(Exception ignored){}}
-    private void openLog(){try{File dir=new File(getExternalFilesDir(null),"logs");dir.mkdirs();logFile=new File(dir,"e108_"+new SimpleDateFormat("yyyyMMdd_HHmmss",Locale.US).format(new Date())+".log");logWriter=new BufferedWriter(new FileWriter(logFile,true));}catch(Exception ignored){}}
+    private void openLog(){try{File dir=new File(getExternalFilesDir(null),"logs");dir.mkdirs();logFile=new File(dir,"e108_"+new SimpleDateFormat("yyyyMMdd_HHmmss",Locale.US).format(new Date())+".log");logWriter=new BufferedWriter(new FileWriter(logFile,true));log("SERVICE START v0.5.0 firmware=0x55002613 baud=460800");}catch(Exception ignored){}}
     private void registerUsbReceiver(){IntentFilter f=new IntentFilter();f.addAction(USB_PERMISSION);f.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);f.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);if(Build.VERSION.SDK_INT>=33)registerReceiver(receiver,f,Context.RECEIVER_NOT_EXPORTED);else registerReceiver(receiver,f);}
     private void createChannel(){if(Build.VERSION.SDK_INT>=26)((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(new NotificationChannel(CHANNEL,"E108 GNSS",NotificationManager.IMPORTANCE_LOW));}
-    private Notification notification(String text){PendingIntent pi=PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class),PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);return new Notification.Builder(this,CHANNEL).setSmallIcon(android.R.drawable.ic_menu_mylocation).setContentTitle("E108 GNSS 0x55002613").setContentText(text).setContentIntent(pi).setOngoing(true).build();}
+    private Notification notification(String text){PendingIntent pi=PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class),PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);return new Notification.Builder(this,CHANNEL).setSmallIcon(android.R.drawable.ic_menu_mylocation).setContentTitle("E108 GNSS 0x55002613 v0.5").setContentText(text).setContentIntent(pi).setOngoing(true).build();}
     private static String deviceText(UsbDevice d){return d==null?"null":String.format(Locale.US,"%04X:%04X id=%d path=%s",d.getVendorId(),d.getProductId(),d.getDeviceId(),d.getDeviceName());}
 }
