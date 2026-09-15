@@ -1,0 +1,67 @@
+name: Build E108 v0.6.0A2 Native HAL Proxy
+on:
+  push:
+    branches: [ e108-build-v0.6.0a2 ]
+    paths:
+      - 'native_hal/**'
+      - '.github/workflows/build-e108-v060a2-native.yml'
+  workflow_dispatch:
+
+jobs:
+  build-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve Android NDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          if [ -n "${ANDROID_NDK_LATEST_HOME:-}" ] && [ -d "$ANDROID_NDK_LATEST_HOME" ]; then
+            NDK="$ANDROID_NDK_LATEST_HOME"
+          elif [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+            NDK="$ANDROID_NDK_HOME"
+          else
+            NDK="$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          fi
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+
+      - name: Build arm64 gps.default.so ABI88 proxy
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="$TOOL/aarch64-linux-android33-clang"
+          STRIP="$TOOL/llvm-strip"
+          READELF="$TOOL/llvm-readelf"
+          NM="$TOOL/llvm-nm"
+          mkdir -p out
+          "$CC" -std=c11 -shared -fPIC -O2 -fvisibility=hidden \
+            -include native_hal/proxy_prefix.h \
+            native_hal/gps_proxy.c \
+            -Wl,-soname,gps.default.so -llog -ldl \
+            -o out/gps.default.so
+          "$STRIP" --strip-unneeded out/gps.default.so
+          "$READELF" -h out/gps.default.so
+          "$READELF" -d out/gps.default.so
+          "$NM" -D out/gps.default.so | grep -E ' HMI$'
+          file out/gps.default.so
+          sha256sum out/gps.default.so | tee out/SHA256SUMS.txt
+          cp native_hal/gps_proxy.c out/gps_proxy.c
+          cp native_hal/proxy_prefix.h out/proxy_prefix.h
+          cat > out/BUILD_INFO.txt <<'EOF'
+          E108 GNSS Native HAL Proxy v0.6.0A2
+          Target: UIS7870 / arm64-v8a / Android 13 API 33
+          Purpose: ABI-safe transparent proxy of stock Unisoc gps.default.so.
+          Critical fix: preserve full 88-byte vendor GpsInterface, including inject_best_location at +56, and patch only init(+8)/get_extension(+80).
+          Callback table is cloned using the runtime size before set_capabilities is patched.
+          A2 still does NOT emit E108 GnssData; it validates stable HIDL/legacy measurement bring-up first.
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: E108-Native-HAL-Proxy-v0.6.0A2
+          path: out/
+          if-no-files-found: error
