@@ -2,6 +2,11 @@ package com.seaeast.e108gnss.core;
 
 import android.os.SystemClock;
 
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -12,21 +17,27 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * Lightweight RTCM3 / MSM diagnostics for field testing.
+ * RTCM3 / MSM field diagnostics for E108 field testing.
  *
- * This class deliberately does not pretend to be an Android Raw GNSS provider. It only
- * validates that the E108 stream contains the observation fields needed by a future
- * Native GNSS HAL (MSM4/5/7, especially MSM7) and reports message rates/field presence.
+ * v0.5.1 improvements:
+ *  - distinguish RTCM frame rate from observation epoch rate;
+ *  - count NavIC in constellation/MSM7 totals;
+ *  - report PR/PH/RR/CNR completeness ratios;
+ *  - avoid calling a stream "fully good" just because some carrier phase exists.
+ *
+ * This is still a diagnostic layer, not an Android GnssMeasurement provider.
  */
 public final class RtcmDiagnostics {
     private static final long RATE_WINDOW_MS = 5000;
-    private static final int MAX_TS_PER_TYPE = 256;
+    private static final int MAX_TS_PER_TYPE = 512;
 
     private static final class TypeStat {
         long count;
         long lastElapsed;
         int lastBytes;
-        final ArrayDeque<Long> timestamps = new ArrayDeque<>();
+        final ArrayDeque<Long> frameTimestamps = new ArrayDeque<>();
+        final ArrayDeque<Long> epochTimestamps = new ArrayDeque<>();
+        long lastEpochRaw = Long.MIN_VALUE;
         MsmSummary lastMsm;
     }
 
@@ -52,11 +63,17 @@ public final class RtcmDiagnostics {
         public String compact() {
             if (!parsed) return "parse=" + (error.isEmpty() ? "FAIL" : error);
             return String.format(Locale.US,
-                    "%s MSM%d sat=%d sig=%d cell=%d PR=%d PH=%d RR=%d CNR=%d HC=%d",
+                    "%s MSM%d sat=%d sig=%d cell=%d PR=%d PH=%d RR=%d CNR=%d HC=%d epoch=%d%s",
                     constellation, subtype, satellites, signals, cells,
-                    pseudorangeValid, phaseValid, rateValid, cnrPositive, halfCycleSet);
+                    pseudorangeValid, phaseValid, rateValid, cnrPositive, halfCycleSet,
+                    epochRaw, multipleMessage ? " M" : "");
         }
     }
+
+    private static final Object RAW_LOCK=new Object();
+    private static BufferedOutputStream rawOut;
+    private static File rawFile;
+    private static long rawBytes=0,rawFrames=0;
 
     private final Map<Integer, TypeStat> stats = new HashMap<>();
     private long frames;
@@ -71,6 +88,7 @@ public final class RtcmDiagnostics {
     }
 
     public synchronized void onFrame(byte[] frame) {
+        recordRaw(frame);
         frames++;
         final long now = SystemClock.elapsedRealtime();
         lastFrameElapsed = now;
@@ -88,11 +106,54 @@ public final class RtcmDiagnostics {
         s.count++;
         s.lastElapsed = now;
         s.lastBytes = frame == null ? 0 : frame.length;
-        s.timestamps.addLast(now);
-        while (s.timestamps.size() > MAX_TS_PER_TYPE) s.timestamps.removeFirst();
-        trim(s.timestamps, now);
+        s.frameTimestamps.addLast(now);
+        capAndTrim(s.frameTimestamps, now);
 
-        if (isMsm(type)) s.lastMsm = parseMsm(frame);
+        if (isMsm(type)) {
+            MsmSummary m = parseMsm(frame);
+            s.lastMsm = m;
+            if (m.parsed && m.epochRaw != s.lastEpochRaw) {
+                s.lastEpochRaw = m.epochRaw;
+                s.epochTimestamps.addLast(now);
+                capAndTrim(s.epochTimestamps, now);
+            }
+        }
+    }
+
+    public static String startRawRecording(File externalFilesDir){
+        synchronized(RAW_LOCK){
+            try{
+                if(rawOut!=null)return rawRecordingStatus();
+                File base=externalFilesDir==null?null:new File(externalFilesDir,"raw");
+                if(base==null)throw new IllegalStateException("externalFilesDir=null");
+                if(!base.exists()&&!base.mkdirs())throw new IllegalStateException("mkdir failed");
+                rawFile=new File(base,"rtcm_"+new SimpleDateFormat("yyyyMMdd_HHmmss",Locale.US).format(new Date())+".rtcm3");
+                rawOut=new BufferedOutputStream(new FileOutputStream(rawFile),65536);
+                rawBytes=0;rawFrames=0;
+                return rawRecordingStatus();
+            }catch(Exception e){rawOut=null;return "录制失败: "+e.getClass().getSimpleName()+":"+e.getMessage();}
+        }
+    }
+
+    public static String stopRawRecording(){
+        synchronized(RAW_LOCK){
+            if(rawOut!=null){try{rawOut.flush();rawOut.close();}catch(Exception ignored){}rawOut=null;}
+            return rawRecordingStatus();
+        }
+    }
+
+    public static String rawRecordingStatus(){
+        synchronized(RAW_LOCK){
+            return (rawOut!=null?"录制中":"已停止")+" frames="+rawFrames+" bytes="+rawBytes+"\n文件："+(rawFile==null?"--":rawFile.getAbsolutePath());
+        }
+    }
+
+    private static void recordRaw(byte[] frame){
+        synchronized(RAW_LOCK){
+            if(rawOut==null||frame==null)return;
+            try{rawOut.write(frame);rawFrames++;rawBytes+=frame.length;}
+            catch(Exception e){try{rawOut.close();}catch(Exception ignored){}rawOut=null;}
+        }
     }
 
     public synchronized String brief() {
@@ -106,12 +167,14 @@ public final class RtcmDiagnostics {
         long now = SystemClock.elapsedRealtime();
         StringBuilder sb = new StringBuilder();
         long age = lastFrameElapsed == 0 ? -1 : now - lastFrameElapsed;
+        double badPct = frames <= 0 ? 0.0 : (100.0 * invalidFrames / frames);
         sb.append(String.format(Locale.US,
-                "帧 total=%d valid=%d bad=%d lastAge=%dms\n", frames, validFrames, invalidFrames, age));
+                "帧 total=%d valid=%d bad=%d (%.3f%%) lastAge=%dms\n",
+                frames, validFrames, invalidFrames, badPct, age));
 
         if (stats.isEmpty()) {
             sb.append("尚未收到有效RTCM3。\n");
-            sb.append("Raw状态：WAITING");
+            sb.append("观测状态：WAITING");
             return sb.toString();
         }
 
@@ -122,71 +185,89 @@ public final class RtcmDiagnostics {
             }
         });
 
-        int msm7Constellations = 0;
-        int msmAnyConstellations = 0;
-        boolean gps7=false,glo7=false,gal7=false,bds7=false,qzss7=false;
+        boolean gps7=false,glo7=false,gal7=false,bds7=false,qzss7=false,navic7=false,sbas7=false;
+        boolean gpsAny=false,gloAny=false,galAny=false,bdsAny=false,qzssAny=false,navicAny=false,sbasAny=false;
         int msmCells=0, pr=0, ph=0, rr=0, cnr=0;
 
         for (int type : types) {
             TypeStat s = stats.get(type);
-            trim(s.timestamps, now);
-            double hz = rateHz(s.timestamps);
-            sb.append(String.format(Locale.US, "%d %-12s %5.1f Hz  n=%d  %dB",
-                    type, name(type), hz, s.count, s.lastBytes));
+            trim(s.frameTimestamps, now);
+            trim(s.epochTimestamps, now);
+            double frameHz = rateHz(s.frameTimestamps);
+            double epochHz = isMsm(type) ? rateHz(s.epochTimestamps) : 0.0;
+            if (isMsm(type)) {
+                sb.append(String.format(Locale.US, "%d %-12s frame=%5.1fHz epoch=%5.1fHz n=%d %dB",
+                        type, name(type), frameHz, epochHz, s.count, s.lastBytes));
+            } else {
+                sb.append(String.format(Locale.US, "%d %-12s %5.1fHz n=%d %dB",
+                        type, name(type), frameHz, s.count, s.lastBytes));
+            }
             if (s.lastMsm != null) {
                 MsmSummary m=s.lastMsm;
                 sb.append("  ").append(m.compact());
                 if (m.parsed) {
                     msmCells += m.cells; pr += m.pseudorangeValid; ph += m.phaseValid;
                     rr += m.rateValid; cnr += m.cnrPositive;
+                    String c=m.constellation;
+                    if ("GPS".equals(c)) gpsAny=true;
+                    else if ("GLO".equals(c)) gloAny=true;
+                    else if ("GAL".equals(c)) galAny=true;
+                    else if ("BDS".equals(c)) bdsAny=true;
+                    else if ("QZSS".equals(c)) qzssAny=true;
+                    else if ("NAVIC".equals(c)) navicAny=true;
+                    else if ("SBAS".equals(c)) sbasAny=true;
                     if (m.subtype == 7) {
-                        if ("GPS".equals(m.constellation)) gps7=true;
-                        else if ("GLO".equals(m.constellation)) glo7=true;
-                        else if ("GAL".equals(m.constellation)) gal7=true;
-                        else if ("BDS".equals(m.constellation)) bds7=true;
-                        else if ("QZSS".equals(m.constellation)) qzss7=true;
+                        if ("GPS".equals(c)) gps7=true;
+                        else if ("GLO".equals(c)) glo7=true;
+                        else if ("GAL".equals(c)) gal7=true;
+                        else if ("BDS".equals(c)) bds7=true;
+                        else if ("QZSS".equals(c)) qzss7=true;
+                        else if ("NAVIC".equals(c)) navic7=true;
+                        else if ("SBAS".equals(c)) sbas7=true;
                     }
                 }
             }
             sb.append('\n');
         }
 
-        boolean gpsAny=false,gloAny=false,galAny=false,bdsAny=false,qzssAny=false;
-        for (int type:types) {
-            if (!isMsm(type)) continue;
-            String c=constellation(type);
-            if ("GPS".equals(c)) gpsAny=true;
-            else if ("GLO".equals(c)) gloAny=true;
-            else if ("GAL".equals(c)) galAny=true;
-            else if ("BDS".equals(c)) bdsAny=true;
-            else if ("QZSS".equals(c)) qzssAny=true;
-        }
-        if(gpsAny)msmAnyConstellations++; if(gloAny)msmAnyConstellations++; if(galAny)msmAnyConstellations++;
-        if(bdsAny)msmAnyConstellations++; if(qzssAny)msmAnyConstellations++;
-        if(gps7)msm7Constellations++; if(glo7)msm7Constellations++; if(gal7)msm7Constellations++;
-        if(bds7)msm7Constellations++; if(qzss7)msm7Constellations++;
+        int msmAnyConstellations=countTrue(gpsAny,gloAny,galAny,bdsAny,qzssAny,navicAny,sbasAny);
+        int msm7Constellations=countTrue(gps7,glo7,gal7,bds7,qzss7,navic7,sbas7);
+        double prPct = pct(pr,msmCells), phPct=pct(ph,msmCells), rrPct=pct(rr,msmCells), cnrPct=pct(cnr,msmCells);
 
         sb.append(String.format(Locale.US,
-                "MSM汇总：星座=%d  MSM7星座=%d  cell=%d  PR=%d  PH=%d  RR=%d  CNR=%d\n",
-                msmAnyConstellations, msm7Constellations, msmCells, pr, ph, rr, cnr));
+                "MSM汇总：星座=%d MSM7星座=%d cell=%d | PR=%d(%.0f%%) PH=%d(%.0f%%) RR=%d(%.0f%%) CNR=%d(%.0f%%)\n",
+                msmAnyConstellations, msm7Constellations, msmCells,
+                pr,prPct,ph,phPct,rr,rrPct,cnr,cnrPct));
 
-        String raw;
-        if (msm7Constellations >= 2 && pr > 0 && ph > 0 && rr > 0 && cnr > 0) {
-            raw = "GOOD：已看到多星座MSM7及伪距/载波相位/距离率/CNR字段；可进入Native HAL转换测试";
-        } else if (msmAnyConstellations > 0 && (pr > 0 || ph > 0)) {
-            raw = "PARTIAL：已有MSM观测，但MSM7/关键字段/星座数量仍不足，先检查E108 RTCM输出配置";
-        } else {
-            raw = "NO-OBS：目前没有可确认的MSM观测字段";
-        }
-        sb.append("Raw状态：").append(raw);
+        boolean obsReady = msm7Constellations >= 2 && msmCells > 0 && prPct >= 80.0 && rrPct >= 80.0 && cnrPct >= 80.0;
+        String obs = obsReady
+                ? "OBS_READY：多星座MSM7 + 伪距/距离率/CNR已具备GnssMeasurement转换基础"
+                : (msmAnyConstellations>0 ? "OBS_PARTIAL：已有MSM，但关键观测完整度或星座数不足" : "NO_OBS：未确认MSM观测");
+        String carrier;
+        if (msmCells <= 0) carrier="WAITING";
+        else if (phPct >= 80.0) carrier="FULL-ish（>=80%）";
+        else if (phPct >= 20.0) carrier="PARTIAL（20-79%）";
+        else carrier="VERY_PARTIAL（<20%）";
+
+        sb.append("观测状态：").append(obs).append('\n');
+        sb.append(String.format(Locale.US,"载波相位：%s，当前PH完整度 %.1f%%\n",carrier,phPct));
+        sb.append("HAL建议：");
+        if(obsReady) sb.append("可以开始GnssMeasurement/GnssClock转换；载波相位单独按完整度处理，不能把少量PH误判成全量可用。");
+        else sb.append("先检查E108 RTCM MSM配置和实际观测字段，再进入HAL。");
         return sb.toString();
     }
 
+    private static int countTrue(boolean... v){int n=0;for(boolean b:v)if(b)n++;return n;}
+    private static double pct(int n,int d){return d<=0?0.0:100.0*n/d;}
+
+    private static void capAndTrim(ArrayDeque<Long> q,long now){
+        while(q.size()>MAX_TS_PER_TYPE)q.removeFirst();
+        trim(q,now);
+    }
     private static void trim(ArrayDeque<Long> q,long now){
         long min=now-RATE_WINDOW_MS;
         while(!q.isEmpty() && q.peekFirst()<min) q.removeFirst();
     }
-
     private static double rateHz(ArrayDeque<Long> q){
         if(q.isEmpty()) return 0.0;
         if(q.size()==1) return 0.2;
