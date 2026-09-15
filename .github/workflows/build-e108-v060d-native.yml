@@ -1,0 +1,120 @@
+name: Build E108 v0.6.0D Full GNSS+INS HAL
+on:
+  push:
+    branches: [ e108-build-v0.6.0d ]
+    paths:
+      - 'source_parts/v060d_*'
+      - '.github/workflows/build-e108-v060d-native.yml'
+  workflow_dispatch:
+
+jobs:
+  build-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct v0.6.0C and apply v0.6.0D patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p native_hal out
+
+          # Reconstruct v0.6.0B base.
+          cat source_parts/v060b_00.b64 source_parts/v060b_01a.b64 source_parts/v060b_01b.b64 source_parts/v060b_02.b64 > /tmp/v060b.b64
+          test "$(wc -c </tmp/v060b.b64)" = "40188"
+          base64 -d /tmp/v060b.b64 > native_hal/gps_proxy_raw.cpp
+          test "$(wc -c <native_hal/gps_proxy_raw.cpp)" = "30141"
+
+          # Reconstruct/apply the verified v0.6.0C patch.
+          cat source_parts/v060c_patch_00.b64 source_parts/v060c_patch_01.b64 source_parts/v060c_patch_02.b64 > /tmp/v060c.patch.gz.b64
+          test "$(wc -c </tmp/v060c.patch.gz.b64)" = "11112"
+          echo 'bd8f75d6b9a0ff6ce7ebba9557b2e548dd8fa75392dd8dafc8219664b263bd68  /tmp/v060c.patch.gz.b64' | sha256sum -c -
+          base64 -d /tmp/v060c.patch.gz.b64 | gzip -dc > /tmp/v060c.patch
+          patch -o native_hal/gps_proxy_unified.cpp native_hal/gps_proxy_raw.cpp < /tmp/v060c.patch
+          test "$(wc -c <native_hal/gps_proxy_unified.cpp)" = "43730"
+          echo '953556b92739c88f5abf74c3689fc8b45f009d72b27488bfd117831d7be33729  native_hal/gps_proxy_unified.cpp' | sha256sum -c -
+
+          # Apply v0.6.0D fixes/features.
+          test "$(wc -c <source_parts/v060d_patch.gz.b64)" = "10248"
+          echo 'cea654398fa24ae809ccc792de48a86c53fb5413474f4298c9177040a9407a70  source_parts/v060d_patch.gz.b64' | sha256sum -c -
+          base64 -d source_parts/v060d_patch.gz.b64 | gzip -dc > /tmp/v060d.patch
+          patch -o native_hal/gps_proxy_unified_d.cpp native_hal/gps_proxy_unified.cpp < /tmp/v060d.patch
+          test "$(wc -c <native_hal/gps_proxy_unified_d.cpp)" = "57977"
+          echo '4a31beda67a86976b899db07e5f2ebb577ba8d8042980f89dac1797d48be9d50  native_hal/gps_proxy_unified_d.cpp' | sha256sum -c -
+          grep -q 'E108GpsUnifiedD' native_hal/gps_proxy_unified_d.cpp
+          grep -q 'POINS' native_hal/gps_proxy_unified_d.cpp
+          grep -q 'GPS_CAPABILITY_MEASUREMENTS' native_hal/gps_proxy_unified_d.cpp
+          grep -q '/data/vendor/e108gnss/unified_gnss.stats' native_hal/gps_proxy_unified_d.cpp
+
+          # Reconstruct robust userspace USBFS CH340 bridge.
+          test "$(wc -c <source_parts/v060d_bridge.cpp.gz.b64)" = "3748"
+          echo '6b3208bf97f0a76cef26508c7346939e80fc491ed085f569278b97806a3a76a8  source_parts/v060d_bridge.cpp.gz.b64' | sha256sum -c -
+          base64 -d source_parts/v060d_bridge.cpp.gz.b64 | gzip -dc > native_hal/e108_usb_bridge_d.cpp
+          test "$(wc -c <native_hal/e108_usb_bridge_d.cpp)" = "7096"
+          echo '29e21a5224734ecd4b3c40db5410c2484609e39cb0e0a56ce3a830f326607646  native_hal/e108_usb_bridge_d.cpp' | sha256sum -c -
+
+      - name: Resolve Android NDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          if [ -n "${ANDROID_NDK_LATEST_HOME:-}" ] && [ -d "$ANDROID_NDK_LATEST_HOME" ]; then
+            NDK="$ANDROID_NDK_LATEST_HOME"
+          elif [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+            NDK="$ANDROID_NDK_HOME"
+          else
+            NDK="$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          fi
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++"
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+
+      - name: Build arm64 Full E108 GNSS plus INS HAL and robust bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CXX="$TOOL/aarch64-linux-android33-clang++"
+          STRIP="$TOOL/llvm-strip"
+          READELF="$TOOL/llvm-readelf"
+          NM="$TOOL/llvm-nm"
+
+          "$CXX" -std=c++17 -shared -fPIC -O2 -fvisibility=hidden -static-libstdc++ \
+            native_hal/gps_proxy_unified_d.cpp \
+            -Wl,-soname,gps.default.so -Wl,--exclude-libs,ALL \
+            -llog -ldl -lm -pthread \
+            -o out/gps.default.so
+          "$STRIP" --strip-unneeded out/gps.default.so
+          "$READELF" -h out/gps.default.so
+          "$READELF" -d out/gps.default.so | tee out/DYNAMIC_GPS.txt
+          "$NM" -D out/gps.default.so | grep -E ' HMI$'
+          ! grep -q 'libc++_shared.so' out/DYNAMIC_GPS.txt
+
+          "$CXX" -std=c++17 -O2 -static-libstdc++ \
+            native_hal/e108_usb_bridge_d.cpp \
+            -pthread -o out/e108_usb_bridge
+          "$STRIP" --strip-unneeded out/e108_usb_bridge
+          "$READELF" -h out/e108_usb_bridge
+          "$READELF" -d out/e108_usb_bridge | tee out/DYNAMIC_BRIDGE.txt
+          ! grep -q 'libc++_shared.so' out/DYNAMIC_BRIDGE.txt
+
+          file out/gps.default.so out/e108_usb_bridge
+          sha256sum out/gps.default.so out/e108_usb_bridge | tee out/SHA256SUMS.txt
+          cp native_hal/gps_proxy_unified_d.cpp out/
+          cp native_hal/e108_usb_bridge_d.cpp out/
+          cat > out/BUILD_INFO.txt <<'EOF'
+          E108 GNSS Native HAL v0.6.0D Full1
+          Target: UIS7870 / Android 13 / arm64 / legacy Unisoc GPS ABI 88 bytes.
+          Location: E108 GGA/RMC -> Android GpsLocation; stock Unisoc is stale/no-E108 fallback.
+          SV: E108 GSV/GSA -> Android GnssSvStatus with stock fallback when stale.
+          Raw: E108 RTCM3 MSM7 -> GnssMeasurement/GnssClock.
+          Capabilities: explicitly republishes MEASUREMENTS while preserving stock capability bits.
+          INS: parses BK166X/E108 $POINS and uses fused velocity/yaw to supplement Location motion fields when INS is active; GGA quality 6 is tracked as inertial-DR solution.
+          USBFS bridge: transient read errors no longer force immediate CH340 re-enumeration; EPIPE clear-halt and persistent-error threshold added.
+          Stats: /data/vendor/e108gnss/unified_gnss.stats.
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: E108-Native-Full-GNSS-INS-v0.6.0D
+          path: out/
+          if-no-files-found: error
