@@ -10,8 +10,8 @@ android {
         applicationId = "com.seaeast.e108gnss"
         minSdk = 26
         targetSdk = 33
-        versionCode = 9
-        versionName = "0.4.2-55002613"
+        versionCode = 10
+        versionName = "0.5.0-55002613"
     }
 
     buildTypes {
