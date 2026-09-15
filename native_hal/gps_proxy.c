@@ -7,9 +7,11 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define LOG_TAG "E108GpsProxy"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 #define HARDWARE_MODULE_TAG 0x48574d54u /* 'HWMT' */
@@ -21,8 +23,35 @@
 #define GPS_MEASUREMENT_ERROR_GENERIC (-101)
 #define STOCK_HAL_PATH "/vendor/lib64/hw/gps.stock.so"
 
+/*
+ * UIS7870 / Unisoc legacy GPS ABI notes (verified from the working v8.0.5
+ * reference binary and the target stock HAL):
+ *
+ *   GpsInterface.size == 88 bytes on arm64.
+ *
+ * The vendor ABI inserts inject_best_location between inject_location and
+ * delete_aiding_data. AOSP's old public GpsInterface is only 80 bytes.
+ * v0.6.0A accidentally returned an 80-byte table while advertising size=88,
+ * shifting delete_aiding_data/set_position_mode/get_extension and leaving the
+ * real get_extension slot at +80 invalid. UnisocGnss::getExtensionGnssConfiguration
+ * then called through a NULL/invalid pointer and crashed the GNSS service.
+ *
+ * A2 treats the stock table as opaque bytes: copy all 88 bytes verbatim and
+ * patch ONLY init (+8) and get_extension (+80). Every vendor-private slot is
+ * retained exactly as shipped by the stock HAL.
+ */
+#define TARGET_GPS_IF_SIZE          88u
+#define GPS_IF_OFF_INIT              8u
+#define GPS_IF_OFF_GET_EXTENSION    80u
+#define MAX_GPS_IF_SIZE            256u
+#define GPS_CALLBACKS_MIN_SIZE      48u
+#define GPS_CB_OFF_SET_CAPS         40u
+#define MAX_CALLBACKS_SIZE         256u
+
 struct hw_module_t;
 struct hw_device_t;
+struct gps_device_t;
+extern struct hw_module_t HMI;
 
 typedef struct hw_module_methods_t {
     int (*open)(const struct hw_module_t* module, const char* id, struct hw_device_t** device);
@@ -48,41 +77,17 @@ typedef struct hw_device_t {
     int (*close)(struct hw_device_t* device);
 } hw_device_t;
 
-/* Android legacy GPS callback table. Pointer-sized placeholder types are used for callbacks
- * we simply pass through unchanged. The layout matches hardware/libhardware gps.h. */
-typedef struct GpsCallbacks {
-    size_t size;
-    void* location_cb;
-    void* status_cb;
-    void* sv_status_cb;
-    void* nmea_cb;
-    void (*set_capabilities_cb)(uint32_t capabilities);
-    void* acquire_wakelock_cb;
-    void* release_wakelock_cb;
-    void* create_thread_cb;
-    void* request_utc_time_cb;
-    void* set_system_info_cb;
-    void* gnss_sv_status_cb;
-} GpsCallbacks;
-
-typedef struct GpsInterface {
-    size_t size;
-    int (*init)(GpsCallbacks* callbacks);
-    int (*start)(void);
-    int (*stop)(void);
-    void (*cleanup)(void);
-    int (*inject_time)(int64_t time_ms, int64_t time_reference_ms, int uncertainty_ms);
-    int (*inject_location)(double latitude, double longitude, float accuracy);
-    void (*delete_aiding_data)(uint16_t flags);
-    int (*set_position_mode)(int mode, int recurrence, uint32_t min_interval,
-                             uint32_t preferred_accuracy, uint32_t preferred_time);
-    const void* (*get_extension)(const char* name);
-} GpsInterface;
+/* Return type is intentionally opaque: the target vendor GpsInterface is 88B. */
+typedef const void* (*get_gps_interface_fn)(struct gps_device_t* dev);
 
 struct gps_device_t {
     struct hw_device_t common;
-    const GpsInterface* (*get_gps_interface)(struct gps_device_t* dev);
+    get_gps_interface_fn get_gps_interface;
 };
+
+typedef int (*gps_init_fn)(void* callbacks);
+typedef const void* (*gps_get_extension_fn)(const char* name);
+typedef void (*gps_set_capabilities_fn)(uint32_t capabilities);
 
 typedef struct GpsMeasurementCallbacks {
     size_t size;
@@ -104,29 +109,56 @@ typedef struct ProxyGpsDevice {
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void* g_stock_handle = NULL;
 static const hw_module_t* g_stock_module = NULL;
-static const GpsInterface* g_stock_if = NULL;
-static GpsInterface g_proxy_if;
-static GpsCallbacks g_callbacks_copy;
-static void (*g_real_set_capabilities)(uint32_t) = NULL;
+
+static const uint8_t* g_stock_if_raw = NULL;
+static size_t g_stock_if_size = 0;
+static gps_init_fn g_stock_init = NULL;
+static gps_get_extension_fn g_stock_get_extension = NULL;
+static uint8_t g_proxy_if[MAX_GPS_IF_SIZE];
+
+/* The stock HAL may retain this pointer after init, so keep the clone alive. */
+static uint8_t* g_callbacks_clone = NULL;
+static size_t g_callbacks_clone_size = 0;
+static gps_set_capabilities_fn g_real_set_capabilities = NULL;
 static uint32_t g_last_stock_caps = 0;
+
 static GpsMeasurementCallbacks g_meas_callbacks;
 static int g_meas_inited = 0;
 
+static size_t raw_size_field(const void* p) {
+    size_t n = 0;
+    if (p) memcpy(&n, p, sizeof(n));
+    return n;
+}
+
+static void* raw_get_ptr(const void* p, size_t off) {
+    void* out = NULL;
+    memcpy(&out, (const uint8_t*)p + off, sizeof(out));
+    return out;
+}
+
+static void raw_set_ptr(void* p, size_t off, const void* fn) {
+    memcpy((uint8_t*)p + off, &fn, sizeof(fn));
+}
+
 static int load_stock_module_locked(void) {
     if (g_stock_module) return 0;
+
     g_stock_handle = dlopen(STOCK_HAL_PATH, RTLD_NOW | RTLD_LOCAL);
     if (!g_stock_handle) {
         LOGE("dlopen %s failed: %s", STOCK_HAL_PATH, dlerror());
         return -ENOENT;
     }
+
     g_stock_module = (const hw_module_t*)dlsym(g_stock_handle, "HMI");
     if (!g_stock_module || !g_stock_module->methods || !g_stock_module->methods->open) {
         LOGE("stock HMI missing/invalid");
-        if (g_stock_handle) dlclose(g_stock_handle);
+        dlclose(g_stock_handle);
         g_stock_handle = NULL;
         g_stock_module = NULL;
         return -EINVAL;
     }
+
     LOGI("stock loaded: id=%s name=%s module_api=0x%04x hal_api=0x%04x",
          g_stock_module->id ? g_stock_module->id : "?",
          g_stock_module->name ? g_stock_module->name : "?",
@@ -137,55 +169,57 @@ static int load_stock_module_locked(void) {
 static void proxy_set_capabilities(uint32_t caps) {
     g_last_stock_caps = caps;
     uint32_t out = caps | GPS_CAPABILITY_MEASUREMENTS;
-    LOGI("capabilities stock=0x%08x -> proxy=0x%08x (MEASUREMENTS added)", caps, out);
+    LOGI("capabilities stock=0x%08x -> proxy=0x%08x", caps, out);
     if (g_real_set_capabilities) g_real_set_capabilities(out);
 }
 
-static int proxy_gps_init(GpsCallbacks* callbacks) {
-    if (!g_stock_if || !g_stock_if->init) return -ENODEV;
-    if (!callbacks || callbacks->size < offsetof(GpsCallbacks, set_capabilities_cb) + sizeof(void*)) {
-        LOGE("GpsCallbacks invalid size=%zu", callbacks ? callbacks->size : 0u);
+static int proxy_gps_init(void* callbacks) {
+    if (!g_stock_init) return -ENODEV;
+    if (!callbacks) {
+        LOGE("GpsCallbacks NULL");
         return -EINVAL;
     }
-    memset(&g_callbacks_copy, 0, sizeof(g_callbacks_copy));
-    size_t n = callbacks->size < sizeof(g_callbacks_copy) ? callbacks->size : sizeof(g_callbacks_copy);
-    memcpy(&g_callbacks_copy, callbacks, n);
-    g_real_set_capabilities = callbacks->set_capabilities_cb;
-    g_callbacks_copy.set_capabilities_cb = proxy_set_capabilities;
-    LOGI("GpsInterface.init callbacks_size=%zu stock_if_size=%zu", callbacks->size, g_stock_if->size);
-    int rc = g_stock_if->init(&g_callbacks_copy);
+
+    const size_t cb_size = raw_size_field(callbacks);
+    if (cb_size < GPS_CALLBACKS_MIN_SIZE || cb_size > MAX_CALLBACKS_SIZE) {
+        LOGE("GpsCallbacks unexpected size=%zu", cb_size);
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    uint8_t* fresh = (uint8_t*)malloc(cb_size);
+    if (!fresh) {
+        pthread_mutex_unlock(&g_lock);
+        return -ENOMEM;
+    }
+    memcpy(fresh, callbacks, cb_size);
+
+    /* set_capabilities_cb is the stable AOSP slot at +40 in GpsCallbacks. */
+    g_real_set_capabilities = (gps_set_capabilities_fn)raw_get_ptr(callbacks, GPS_CB_OFF_SET_CAPS);
+    if (g_real_set_capabilities) {
+        raw_set_ptr(fresh, GPS_CB_OFF_SET_CAPS, (const void*)proxy_set_capabilities);
+    } else {
+        LOGW("GpsCallbacks has no set_capabilities_cb; leaving NULL");
+    }
+
+    /* Deliberately keep only the latest clone alive. The stock Unisoc HAL is a
+     * singleton and init is expected once; if it re-inits, the new callback set
+     * supersedes the old one. */
+    uint8_t* old = g_callbacks_clone;
+    g_callbacks_clone = fresh;
+    g_callbacks_clone_size = cb_size;
+    pthread_mutex_unlock(&g_lock);
+
+    LOGI("GpsInterface.init callbacks_size=%zu stock_if_size=%zu", cb_size, g_stock_if_size);
+    int rc = g_stock_init(g_callbacks_clone);
     LOGI("stock init rc=%d last_stock_caps=0x%08x", rc, g_last_stock_caps);
+
+    /* Do not free 'old' before stock init succeeds; once init returns, Unisoc's
+     * singleton should have switched to the new callback table. */
+    if (old && old != g_callbacks_clone) free(old);
     return rc;
 }
 
-static int proxy_start(void) {
-    return (g_stock_if && g_stock_if->start) ? g_stock_if->start() : -ENODEV;
-}
-static int proxy_stop(void) {
-    return (g_stock_if && g_stock_if->stop) ? g_stock_if->stop() : -ENODEV;
-}
-static void proxy_cleanup(void) {
-    if (g_stock_if && g_stock_if->cleanup) g_stock_if->cleanup();
-}
-static int proxy_inject_time(int64_t t, int64_t ref, int unc) {
-    return (g_stock_if && g_stock_if->inject_time) ? g_stock_if->inject_time(t, ref, unc) : -ENOSYS;
-}
-static int proxy_inject_location(double lat, double lon, float acc) {
-    return (g_stock_if && g_stock_if->inject_location) ? g_stock_if->inject_location(lat, lon, acc) : -ENOSYS;
-}
-static void proxy_delete_aiding_data(uint16_t flags) {
-    if (g_stock_if && g_stock_if->delete_aiding_data) g_stock_if->delete_aiding_data(flags);
-}
-static int proxy_set_position_mode(int mode, int recurrence, uint32_t min_interval,
-                                   uint32_t preferred_accuracy, uint32_t preferred_time) {
-    return (g_stock_if && g_stock_if->set_position_mode)
-        ? g_stock_if->set_position_mode(mode, recurrence, min_interval, preferred_accuracy, preferred_time)
-        : -ENOSYS;
-}
-
-/* v0.6.0A intentionally exposes the legacy measurement extension and verifies that the
- * stock HIDL 2.1 adapter accepts it. It does not emit GnssData yet. v0.6.0B will feed
- * E108 MSM7 observations after this ABI path is confirmed on the target head unit. */
 static int proxy_measurement_init(GpsMeasurementCallbacks* callbacks) {
     pthread_mutex_lock(&g_lock);
     if (g_meas_inited) {
@@ -203,7 +237,8 @@ static int proxy_measurement_init(GpsMeasurementCallbacks* callbacks) {
     memcpy(&g_meas_callbacks, callbacks, n);
     g_meas_inited = 1;
     pthread_mutex_unlock(&g_lock);
-    LOGI("MEASUREMENT_INTERFACE init OK callbacks_size=%zu gps_cb=%p gnss_cb=%p /dev/ttyE108=%s",
+
+    LOGI("MEASUREMENT_INTERFACE init OK callbacks_size=%zu gps_cb=%p gnss_cb=%p ttyE108=%s",
          callbacks->size, callbacks->measurement_callback, callbacks->gnss_measurement_callback,
          access("/dev/ttyE108", F_OK) == 0 ? "present" : "missing");
     return GPS_MEASUREMENT_OPERATION_SUCCESS;
@@ -225,44 +260,69 @@ static const GpsMeasurementInterface g_measurement_if = {
 
 static const void* proxy_get_extension(const char* name) {
     if (name && strcmp(name, GPS_MEASUREMENT_INTERFACE) == 0) {
-        const void* stock_meas = NULL;
-        if (g_stock_if && g_stock_if->get_extension) stock_meas = g_stock_if->get_extension(name);
-        LOGI("get_extension(%s): stock=%p -> E108 proxy measurement=%p", name, stock_meas, &g_measurement_if);
+        const void* stock_meas = g_stock_get_extension ? g_stock_get_extension(name) : NULL;
+        LOGI("get_extension(%s): stock=%p -> E108 measurement=%p",
+             name, stock_meas, &g_measurement_if);
         return &g_measurement_if;
     }
-    const void* out = (g_stock_if && g_stock_if->get_extension) ? g_stock_if->get_extension(name) : NULL;
+
+    const void* out = g_stock_get_extension ? g_stock_get_extension(name) : NULL;
     LOGI("get_extension(%s) -> stock=%p", name ? name : "NULL", out);
     return out;
 }
 
-static const GpsInterface* proxy_get_gps_interface(struct gps_device_t* dev) {
+static const void* proxy_get_gps_interface(struct gps_device_t* dev) {
     ProxyGpsDevice* p = (ProxyGpsDevice*)dev;
     if (!p || !p->stock_dev || !p->stock_dev->get_gps_interface) return NULL;
-    const GpsInterface* stock = p->stock_dev->get_gps_interface(p->stock_dev);
+
+    const void* stock = p->stock_dev->get_gps_interface(p->stock_dev);
     if (!stock) {
         LOGE("stock get_gps_interface returned NULL");
         return NULL;
     }
-    g_stock_if = stock;
-    memset(&g_proxy_if, 0, sizeof(g_proxy_if));
-    g_proxy_if.size = stock->size;
-    g_proxy_if.init = proxy_gps_init;
-    g_proxy_if.start = proxy_start;
-    g_proxy_if.stop = proxy_stop;
-    g_proxy_if.cleanup = proxy_cleanup;
-    g_proxy_if.inject_time = proxy_inject_time;
-    g_proxy_if.inject_location = proxy_inject_location;
-    g_proxy_if.delete_aiding_data = proxy_delete_aiding_data;
-    g_proxy_if.set_position_mode = proxy_set_position_mode;
-    g_proxy_if.get_extension = proxy_get_extension;
-    LOGI("proxy interface ready stock_size=%zu proxy_known_size=%zu", stock->size, sizeof(g_proxy_if));
-    return &g_proxy_if;
+
+    const size_t stock_size = raw_size_field(stock);
+    if (stock_size != TARGET_GPS_IF_SIZE) {
+        LOGE("unsupported stock GpsInterface size=%zu expected=%u; refusing unsafe proxy",
+             stock_size, TARGET_GPS_IF_SIZE);
+        return NULL;
+    }
+    if (stock_size > sizeof(g_proxy_if)) return NULL;
+
+    pthread_mutex_lock(&g_lock);
+    g_stock_if_raw = (const uint8_t*)stock;
+    g_stock_if_size = stock_size;
+    memcpy(g_proxy_if, stock, stock_size);
+
+    g_stock_init = (gps_init_fn)raw_get_ptr(stock, GPS_IF_OFF_INIT);
+    g_stock_get_extension = (gps_get_extension_fn)raw_get_ptr(stock, GPS_IF_OFF_GET_EXTENSION);
+    if (!g_stock_init || !g_stock_get_extension) {
+        LOGE("stock critical slots invalid init=%p get_extension=%p",
+             (void*)g_stock_init, (void*)g_stock_get_extension);
+        pthread_mutex_unlock(&g_lock);
+        return NULL;
+    }
+
+    /* Preserve every other vendor slot byte-for-byte, especially the Unisoc
+     * inject_best_location slot at +56. */
+    raw_set_ptr(g_proxy_if, GPS_IF_OFF_INIT, (const void*)proxy_gps_init);
+    raw_set_ptr(g_proxy_if, GPS_IF_OFF_GET_EXTENSION, (const void*)proxy_get_extension);
+    pthread_mutex_unlock(&g_lock);
+
+    LOGI("ABI88 proxy ready size=%zu init(stock=%p proxy=%p) get_ext(stock=%p proxy=%p) best_location_slot=%p",
+         stock_size,
+         (void*)g_stock_init, (void*)proxy_gps_init,
+         (void*)g_stock_get_extension, (void*)proxy_get_extension,
+         raw_get_ptr(stock, 56));
+    return g_proxy_if;
 }
 
 static int proxy_device_close(struct hw_device_t* hwdev) {
     ProxyGpsDevice* p = (ProxyGpsDevice*)hwdev;
     int rc = 0;
-    if (p && p->stock_dev && p->stock_dev->common.close) rc = p->stock_dev->common.close(&p->stock_dev->common);
+    if (p && p->stock_dev && p->stock_dev->common.close) {
+        rc = p->stock_dev->common.close(&p->stock_dev->common);
+    }
     LOGI("proxy device close rc=%d", rc);
     free(p);
     return rc;
@@ -272,6 +332,7 @@ static int proxy_open(const struct hw_module_t* module, const char* id, struct h
     (void)module;
     if (!device) return -EINVAL;
     *device = NULL;
+
     pthread_mutex_lock(&g_lock);
     int lrc = load_stock_module_locked();
     pthread_mutex_unlock(&g_lock);
@@ -289,12 +350,14 @@ static int proxy_open(const struct hw_module_t* module, const char* id, struct h
         if (stock_hw->close) stock_hw->close(stock_hw);
         return -ENOMEM;
     }
+
     p->stock_dev = (struct gps_device_t*)stock_hw;
     p->public_dev.common = *stock_hw;
     p->public_dev.common.module = (struct hw_module_t*)&HMI;
     p->public_dev.common.close = proxy_device_close;
     p->public_dev.get_gps_interface = proxy_get_gps_interface;
     *device = &p->public_dev.common;
+
     LOGI("proxy open OK id=%s stock_dev=%p proxy_dev=%p", id ? id : "NULL", stock_hw, *device);
     return 0;
 }
@@ -309,7 +372,7 @@ hw_module_t HMI = {
     .module_api_version = 1,
     .hal_api_version = 0,
     .id = "gps",
-    .name = "E108 GNSS transparent legacy HAL proxy v0.6.0A",
+    .name = "E108 GNSS ABI88 transparent legacy HAL proxy v0.6.0A2",
     .author = "SeaEast/OpenAI development build",
     .methods = &g_methods,
     .dso = NULL,
