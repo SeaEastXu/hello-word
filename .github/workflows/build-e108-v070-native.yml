@@ -38,7 +38,7 @@ jobs:
           echo '0e28926d34402727759198b2d05719dd811ef050db429674d87f3c95c9e6a098  /tmp/v070.patch.gz.b64' | sha256sum -c -
           base64 -d /tmp/v070.patch.gz.b64 | gzip -dc > /tmp/v070.patch
           patch -o native_hal/gps_default_v070.cpp native_hal/gps_proxy_unified.cpp < /tmp/v070.patch
-          test "$(wc -c <native_hal/gps_default_v070.cpp)" = "53631"
+          test "$(wc -c <native_hal/gps_default_v070.cpp)" = "53694"
           echo '529df54abb84e79b10452f1535a9346aafae2667ed59b379afac9684b633da15  native_hal/gps_default_v070.cpp' | sha256sum -c -
           grep -q 'E108 GNSS Full Takeover HAL v0.7.0' native_hal/gps_default_v070.cpp
 
