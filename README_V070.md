@@ -1,0 +1,1 @@
+E108 GNSS v0.7.0 Full Takeover: E108 Location/NMEA/SV/Raw/GnssClock primary data plane, stock Unisoc retained only for lifecycle/private-extension compatibility and stale-E108 fail-safe.
