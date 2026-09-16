@@ -3,7 +3,7 @@ on:
   push:
     branches: [ e108-build-v0.7.0 ]
     paths:
-      - 'source_parts/v070_hal_*.b64'
+      - 'source_parts/v070_patch_*.b64'
       - 'source_parts/v070_bridge_*.b64'
       - '.github/workflows/build-e108-v070-native.yml'
   workflow_dispatch:
@@ -14,25 +14,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Reconstruct v0.7.0 sources
+      - name: Reconstruct v0.6.0C base and apply v0.7.0 patch
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p native_hal native_bridge out
-          cat source_parts/v070_hal_00.b64 source_parts/v070_hal_01.b64 source_parts/v070_hal_02.b64 > /tmp/v070_hal.gz.b64
-          test "$(wc -c </tmp/v070_hal.gz.b64)" = "20344"
-          echo '9542ec0bc76ea77f312c0235e380aae9f36f745dbe1c359fecb921b6d382dbe6  /tmp/v070_hal.gz.b64' | sha256sum -c -
-          base64 -d /tmp/v070_hal.gz.b64 | gzip -dc > native_hal/gps_v070.cpp
-          test "$(wc -c <native_hal/gps_v070.cpp)" = "57775"
-          echo '24c55049467bd116c237f124bd70728e1a149181dc183154d1dee24fc442a2a9  native_hal/gps_v070.cpp' | sha256sum -c -
-          grep -q 'E108 GNSS Full-Takeover HAL v0.7.0' native_hal/gps_v070.cpp
+          mkdir -p native_hal out
 
-          cat source_parts/v070_bridge_00.b64 > /tmp/v070_bridge.gz.b64
-          test "$(wc -c </tmp/v070_bridge.gz.b64)" = "4008"
-          echo '81f71f436d0cbfd5e9875fa1af00313a3ab741a45af34a1a59b75de613d95b48  /tmp/v070_bridge.gz.b64' | sha256sum -c -
-          base64 -d /tmp/v070_bridge.gz.b64 | gzip -dc > native_bridge/e108_usb_bridge.c
-          test "$(wc -c <native_bridge/e108_usb_bridge.c)" = "8382"
-          echo '48b99a2175a0be77db54e6a53d0c927f50bcf05657c6d8b703c7e5ada7143e86  native_bridge/e108_usb_bridge.c' | sha256sum -c -
+          cat source_parts/v060b_00.b64 source_parts/v060b_01a.b64 source_parts/v060b_01b.b64 source_parts/v060b_02.b64 > /tmp/v060b.b64
+          test "$(wc -c </tmp/v060b.b64)" = "40188"
+          base64 -d /tmp/v060b.b64 > native_hal/gps_proxy_raw.cpp
+          test "$(wc -c <native_hal/gps_proxy_raw.cpp)" = "30141"
+
+          cat source_parts/v060c_patch_00.b64 source_parts/v060c_patch_01.b64 source_parts/v060c_patch_02.b64 > /tmp/v060c.patch.gz.b64
+          test "$(wc -c </tmp/v060c.patch.gz.b64)" = "11112"
+          echo 'bd8f75d6b9a0ff6ce7ebba9557b2e548dd8fa75392dd8dafc8219664b263bd68  /tmp/v060c.patch.gz.b64' | sha256sum -c -
+          base64 -d /tmp/v060c.patch.gz.b64 | gzip -dc > /tmp/v060c.patch
+          patch -o native_hal/gps_proxy_unified.cpp native_hal/gps_proxy_raw.cpp < /tmp/v060c.patch
+          test "$(wc -c <native_hal/gps_proxy_unified.cpp)" = "43730"
+          echo '953556b92739c88f5abf74c3689fc8b45f009d72b27488bfd117831d7be33729  native_hal/gps_proxy_unified.cpp' | sha256sum -c -
+
+          cat source_parts/v070_patch_00.b64 > /tmp/v070.patch.gz.b64
+          test "$(wc -c </tmp/v070.patch.gz.b64)" = "8884"
+          echo '0e28926d34402727759198b2d05719dd811ef050db429674d87f3c95c9e6a098  /tmp/v070.patch.gz.b64' | sha256sum -c -
+          base64 -d /tmp/v070.patch.gz.b64 | gzip -dc > /tmp/v070.patch
+          patch -o native_hal/gps_default_v070.cpp native_hal/gps_proxy_unified.cpp < /tmp/v070.patch
+          test "$(wc -c <native_hal/gps_default_v070.cpp)" = "53631"
+          echo '529df54abb84e79b10452f1535a9346aafae2667ed59b379afac9684b633da15  native_hal/gps_default_v070.cpp' | sha256sum -c -
+          grep -q 'E108 GNSS Full Takeover HAL v0.7.0' native_hal/gps_default_v070.cpp
+
+          cat source_parts/v070_bridge_00.b64 > /tmp/v070.bridge.gz.b64
+          test "$(wc -c </tmp/v070.bridge.gz.b64)" = "4256"
+          echo 'bbe8ea26af5e09d0d03f5ae623e0c2ff6a467426402012edd38302e7e9671478  /tmp/v070.bridge.gz.b64' | sha256sum -c -
+          base64 -d /tmp/v070.bridge.gz.b64 | gzip -dc > native_hal/e108_usb_bridge_v070.cpp
+          test "$(sha256sum native_hal/e108_usb_bridge_v070.cpp | awk '{print $1}')" = "51bc85c8b7638c8bcaa6785e1f8b29bfa376c2e5ecfbf9baf1b7198720b9aa05"
 
       - name: Resolve Android NDK
         shell: bash
@@ -49,19 +63,18 @@ jobs:
           test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++"
           echo "NDK=$NDK" >> "$GITHUB_ENV"
 
-      - name: Build arm64 HAL and USBFS bridge
+      - name: Build arm64 Full Takeover HAL and resilient USBFS bridge
         shell: bash
         run: |
           set -euxo pipefail
           TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           CXX="$TOOL/aarch64-linux-android33-clang++"
-          CC="$TOOL/aarch64-linux-android33-clang"
           STRIP="$TOOL/llvm-strip"
           READELF="$TOOL/llvm-readelf"
           NM="$TOOL/llvm-nm"
 
           "$CXX" -std=c++17 -shared -fPIC -O2 -fvisibility=hidden -static-libstdc++ \
-            native_hal/gps_v070.cpp \
+            native_hal/gps_default_v070.cpp \
             -Wl,-soname,gps.default.so -Wl,--exclude-libs,ALL \
             -llog -ldl -lm -pthread \
             -o out/gps.default.so
@@ -71,22 +84,28 @@ jobs:
           "$READELF" -d out/gps.default.so | tee out/GPS_DYNAMIC.txt
           ! grep -q 'libc++_shared.so' out/GPS_DYNAMIC.txt
 
-          "$CC" -std=gnu11 -O2 -fPIE -pie native_bridge/e108_usb_bridge.c -o out/e108_usb_bridge
+          "$CXX" -std=c++17 -O2 -fPIE -pie -static-libstdc++ \
+            native_hal/e108_usb_bridge_v070.cpp \
+            -Wl,--exclude-libs,ALL \
+            -o out/e108_usb_bridge
           "$STRIP" --strip-unneeded out/e108_usb_bridge
           "$READELF" -h out/e108_usb_bridge | tee out/BRIDGE_ELF.txt
+          "$READELF" -d out/e108_usb_bridge | tee out/BRIDGE_DYNAMIC.txt
+          ! grep -q 'libc++_shared.so' out/BRIDGE_DYNAMIC.txt
 
           file out/gps.default.so out/e108_usb_bridge
           sha256sum out/gps.default.so out/e108_usb_bridge | tee out/SHA256SUMS.txt
-          cp native_hal/gps_v070.cpp out/
-          cp native_bridge/e108_usb_bridge.c out/
+          cp native_hal/gps_default_v070.cpp out/
+          cp native_hal/e108_usb_bridge_v070.cpp out/
           cat > out/BUILD_INFO.txt <<'EOF'
           E108 GNSS Native v0.7.0 Full Takeover
           Target: UIS7870 / Android 13 / arm64 / Unisoc legacy GPS ABI 88 bytes.
-          Healthy E108 supplies: Android Location + NMEA + GNSS SV status + Raw GnssMeasurement + GnssClock.
-          Stock Unisoc remains only as HIDL/private-service scaffolding and a 10-second stale-E108 safety fallback.
-          POINS is parsed. E108 INS yaw is used as Location bearing only when INS_status >= 5 and IMU_status == 1.
-          USBFS bridge keeps the CH340 interface through transient read errors and re-enumerates only on genuine disconnect/repeated hard failure.
-          GPS_CAPABILITY_MEASUREMENTS is re-announced after stock init and measurement init.
+          Healthy E108 supplies Android Location + NMEA + GNSS SV status + Raw GnssMeasurement + GnssClock.
+          Stock Unisoc stays loaded only for private-service/ABI safety and stale-E108 fallback.
+          GPS_CAPABILITY_MEASUREMENTS is force-announced through the proxy callback path.
+          GSA/GSV are parsed into Android GNSS SV status. Stock SV is suppressed while E108 SV data is fresh.
+          INS NMEA is counted and passed through; this build does not replace Android Sensor HAL.
+          USBFS bridge treats timeout/EAGAIN/EINTR as transient, clears EPIPE stalls, and re-enumerates only after genuine/repeated failures.
           EOF
 
       - uses: actions/upload-artifact@v4
