@@ -1,0 +1,96 @@
+name: Build E108 v0.7.0 Full Takeover GNSS
+on:
+  push:
+    branches: [ e108-build-v0.7.0 ]
+    paths:
+      - 'source_parts/v070_hal_*.b64'
+      - 'source_parts/v070_bridge_*.b64'
+      - '.github/workflows/build-e108-v070-native.yml'
+  workflow_dispatch:
+
+jobs:
+  build-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct v0.7.0 sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p native_hal native_bridge out
+          cat source_parts/v070_hal_00.b64 source_parts/v070_hal_01.b64 source_parts/v070_hal_02.b64 > /tmp/v070_hal.gz.b64
+          test "$(wc -c </tmp/v070_hal.gz.b64)" = "20344"
+          echo '9542ec0bc76ea77f312c0235e380aae9f36f745dbe1c359fecb921b6d382dbe6  /tmp/v070_hal.gz.b64' | sha256sum -c -
+          base64 -d /tmp/v070_hal.gz.b64 | gzip -dc > native_hal/gps_v070.cpp
+          test "$(wc -c <native_hal/gps_v070.cpp)" = "57775"
+          echo '24c55049467bd116c237f124bd70728e1a149181dc183154d1dee24fc442a2a9  native_hal/gps_v070.cpp' | sha256sum -c -
+          grep -q 'E108 GNSS Full-Takeover HAL v0.7.0' native_hal/gps_v070.cpp
+
+          cat source_parts/v070_bridge_00.b64 > /tmp/v070_bridge.gz.b64
+          test "$(wc -c </tmp/v070_bridge.gz.b64)" = "4008"
+          echo '81f71f436d0cbfd5e9875fa1af00313a3ab741a45af34a1a59b75de613d95b48  /tmp/v070_bridge.gz.b64' | sha256sum -c -
+          base64 -d /tmp/v070_bridge.gz.b64 | gzip -dc > native_bridge/e108_usb_bridge.c
+          test "$(wc -c <native_bridge/e108_usb_bridge.c)" = "8382"
+          echo '48b99a2175a0be77db54e6a53d0c927f50bcf05657c6d8b703c7e5ada7143e86  native_bridge/e108_usb_bridge.c' | sha256sum -c -
+
+      - name: Resolve Android NDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          if [ -n "${ANDROID_NDK_LATEST_HOME:-}" ] && [ -d "$ANDROID_NDK_LATEST_HOME" ]; then
+            NDK="$ANDROID_NDK_LATEST_HOME"
+          elif [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+            NDK="$ANDROID_NDK_HOME"
+          else
+            NDK="$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          fi
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++"
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+
+      - name: Build arm64 HAL and USBFS bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CXX="$TOOL/aarch64-linux-android33-clang++"
+          CC="$TOOL/aarch64-linux-android33-clang"
+          STRIP="$TOOL/llvm-strip"
+          READELF="$TOOL/llvm-readelf"
+          NM="$TOOL/llvm-nm"
+
+          "$CXX" -std=c++17 -shared -fPIC -O2 -fvisibility=hidden -static-libstdc++ \
+            native_hal/gps_v070.cpp \
+            -Wl,-soname,gps.default.so -Wl,--exclude-libs,ALL \
+            -llog -ldl -lm -pthread \
+            -o out/gps.default.so
+          "$STRIP" --strip-unneeded out/gps.default.so
+          "$NM" -D out/gps.default.so | grep -E ' HMI$'
+          "$READELF" -h out/gps.default.so | tee out/GPS_ELF.txt
+          "$READELF" -d out/gps.default.so | tee out/GPS_DYNAMIC.txt
+          ! grep -q 'libc++_shared.so' out/GPS_DYNAMIC.txt
+
+          "$CC" -std=gnu11 -O2 -fPIE -pie native_bridge/e108_usb_bridge.c -o out/e108_usb_bridge
+          "$STRIP" --strip-unneeded out/e108_usb_bridge
+          "$READELF" -h out/e108_usb_bridge | tee out/BRIDGE_ELF.txt
+
+          file out/gps.default.so out/e108_usb_bridge
+          sha256sum out/gps.default.so out/e108_usb_bridge | tee out/SHA256SUMS.txt
+          cp native_hal/gps_v070.cpp out/
+          cp native_bridge/e108_usb_bridge.c out/
+          cat > out/BUILD_INFO.txt <<'EOF'
+          E108 GNSS Native v0.7.0 Full Takeover
+          Target: UIS7870 / Android 13 / arm64 / Unisoc legacy GPS ABI 88 bytes.
+          Healthy E108 supplies: Android Location + NMEA + GNSS SV status + Raw GnssMeasurement + GnssClock.
+          Stock Unisoc remains only as HIDL/private-service scaffolding and a 10-second stale-E108 safety fallback.
+          POINS is parsed. E108 INS yaw is used as Location bearing only when INS_status >= 5 and IMU_status == 1.
+          USBFS bridge keeps the CH340 interface through transient read errors and re-enumerates only on genuine disconnect/repeated hard failure.
+          GPS_CAPABILITY_MEASUREMENTS is re-announced after stock init and measurement init.
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: E108-Native-Full-Takeover-v0.7.0
+          path: out/
+          if-no-files-found: error
